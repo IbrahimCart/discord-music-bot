@@ -9,7 +9,7 @@ import logging
 import os
 import re
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field  # "field" lets Track.pending default to None without sharing state
 from typing import Optional
 
 import discord
@@ -23,7 +23,10 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional: makes slash commands appear instan
 COOKIES_FILE = os.getenv("COOKIES_FILE")  # optional: cookies.txt if YouTube asks to "confirm you're not a bot"
 MAX_PLAYLIST = int(os.getenv("MAX_PLAYLIST", "100"))
 IDLE_TIMEOUT = 300  # seconds of an empty queue before the bot leaves
-SEARCH_RESULTS = 5  # how many YouTube results to try, in order, before falling back to SoundCloud
+# How many YouTube results to list when the top result is a bad pick or fails to play
+# (edit/remix/reupload, DRM-protected, private, region-locked...).
+# Higher = more chances to find the right version, but a slower fallback.
+SEARCH_RESULTS = 5
 
 log = logging.getLogger("musicbot")
 
@@ -66,25 +69,66 @@ def _extract(source: str) -> Optional[dict]:
     return info
 
 
-def _youtube_candidates(query: str) -> list[str]:
-    """Return links for the top YouTube search results (a quick listing, nothing is resolved yet)."""
+# Words that usually mean "not the original recording". A result is only penalised for a word the
+# user did NOT type themselves, so searching "song name remix" still finds the remix.
+EDIT_WORDS = (
+    "remix", "mashup", "extended", "sped up", "speed up", "slowed", "nightcore", "reverb",
+    "8d", "bass boosted", "cover", "live", "karaoke", "instrumental", "reupload", "loop",
+)
+EDIT_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in EDIT_WORDS) + r")\b", re.I)
+
+
+def _edit_words(text: Optional[str]) -> set[str]:
+    """The edit/remix-style words found in some text (lower-cased)."""
+    return {m.lower() for m in EDIT_RE.findall(text or "")}
+
+
+def _looks_like_edit(title: Optional[str], query: str) -> bool:
+    """True if the title has an edit-style word that the search text didn't ask for."""
+    return bool(_edit_words(title) - _edit_words(query))
+
+
+def _score(entry: dict, query: str) -> int:
+    """Rank a search result: higher = more likely to be the original, official upload."""
+    title = entry.get("title") or ""
+    channel = entry.get("channel") or entry.get("uploader") or ""
+    score = 0
+    if channel.endswith(" - Topic"):  # YouTube's auto-generated official-audio channels
+        score += 3
+    if "vevo" in channel.lower():  # label-run official channels
+        score += 2
+    if re.search(r"official (audio|music video|video)", title, re.I):
+        score += 2
+    score -= 3 * len(_edit_words(title) - _edit_words(query))  # remix/mashup/etc. not asked for
+    return score
+
+
+def _youtube_candidates(query: str) -> list[dict]:
+    """List the top YouTube search results (id, url, title, channel), in YouTube's order.
+
+    Only used as a fallback when the very first result is a bad pick or can't be played; see resolve().
+    """
+    # extract_flat = just list the results, don't fetch each video's stream info. That keeps this
+    # to one cheap request; we only do the expensive lookup for results we actually try.
     opts = {**YDL_OPTS, "extract_flat": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"ytsearch{SEARCH_RESULTS}:{query}", download=False)
-    urls = []
-    for entry in (info or {}).get("entries") or []:
-        url = entry and (entry.get("url") or entry.get("webpage_url"))
-        if url:
-            urls.append(url)
-    return urls
+    results = []
+    for entry in (info or {}).get("entries") or []:  # entries can be None for unavailable results
+        if entry and (entry.get("url") or entry.get("webpage_url")):
+            entry.setdefault("url", entry.get("webpage_url"))
+            results.append(entry)
+    return results
 
 
 async def _try(source: str) -> Optional[dict]:
     """Resolve one source; returns None (and logs) if it is protected, private, missing, etc."""
     loop = asyncio.get_running_loop()
     try:
+        # yt-dlp is blocking, so run it in a thread to keep the bot responsive to other commands.
         info = await loop.run_in_executor(None, _extract, source)
     except Exception as exc:  # yt-dlp raises many kinds of errors (DRM, private, region-locked...)
+        # Not fatal: log it and let resolve() move on to the next option.
         log.warning("Skipping %r: %s", source, str(exc)[:200])
         return None
     return info if info and info.get("url") else None
@@ -93,26 +137,50 @@ async def _try(source: str) -> Optional[dict]:
 async def resolve(query: str) -> Optional[dict]:
     """Return yt-dlp info (with a direct stream 'url') for a link or search text.
 
-    Search text takes the top YouTube result directly (one fast lookup). Only if that fails
-    (protected, unavailable...) does it list the next few results and try them in order, then
-    fall back to SoundCloud. Stream URLs expire, so this runs shortly before a track plays.
+    Search text takes the top YouTube result directly (one fast lookup) and uses it if it looks
+    like the real song. If it fails to play, or its title looks like an edit/remix/reupload, the
+    next few results are listed and ranked (official "- Topic" / VEVO / "official audio" first,
+    edit-style titles last) and tried in order, then SoundCloud. Stream URLs expire, so this runs
+    shortly before a track plays.
     """
+    # A pasted link: just resolve that one link, no searching or ranking.
     if URL_RE.match(query):
         return await _try(query)
 
+    # Fast path: the top YouTube result is the right song almost every time, and this is a
+    # single lookup. Keep it unless its title looks like an edit we weren't asked for.
     info = await _try(f"ytsearch1:{query}")
-    if info:
+    if info and not _looks_like_edit(info.get("title"), query):
         return info
+    if info:
+        log.info("Top result %r looks like an edit; checking other results", info.get("title"))
 
+    # Slow path: either the top result failed to play, or it looks like an edit. List the next
+    # few results so we can choose a better one.
     try:
         candidates = await asyncio.get_running_loop().run_in_executor(None, _youtube_candidates, query)
     except Exception as exc:
         log.warning("YouTube search failed for %r: %s", query, str(exc)[:200])
         candidates = []
-    for url in candidates[1:]:  # the first result is the one that just failed
-        info = await _try(url)
-        if info:
-            return info
+    if info is None and candidates:
+        candidates = candidates[1:]  # the first result is the one that just failed to play
+
+    # Best-looking first. sorted() is stable, so ties keep YouTube's own order.
+    for entry in sorted(candidates, key=lambda e: -_score(e, query)):
+        if info and entry.get("id") == info.get("id"):
+            chosen = info  # already looked up above, no need to ask YouTube again
+        else:
+            chosen = await _try(entry["url"])
+        if chosen:
+            if chosen is not info and info:
+                log.info("Using %r instead of %r", chosen.get("title"), info.get("title"))
+            return chosen
+
+    # The edit-looking top result was playable but the listing gave us nothing better: play it
+    # rather than fail. (If it had failed to play, info is None and we go on to SoundCloud.)
+    if info:
+        return info
+    # Last resort: SoundCloud (not covered by the YouTube results above).
     return await _try(f"scsearch1:{query}")
 
 
@@ -170,7 +238,9 @@ class Track:
     query: str  # a link, or "Artist - Title" search text
     title: Optional[str] = None
     requester: str = ""
-    pending: Optional[asyncio.Task] = field(default=None, repr=False)  # lookup started early
+    # Background lookup of this track's stream, started while the previous song is still playing
+    # (see GuildPlayer._prefetch_next). None until/unless a prefetch was started.
+    pending: Optional[asyncio.Task] = field(default=None, repr=False)
 
     @property
     def label(self) -> str:
@@ -191,15 +261,21 @@ class GuildPlayer:
 
     def add(self, tracks: list[Track]) -> None:
         self.queue.extend(tracks)
-        self._prefetch_next()
+        self._prefetch_next()  # if a song is already playing, start looking up the new "next" track
         self.wake.set()
 
     def _prefetch_next(self) -> None:
-        """While a song plays, look up the next one in the background so it starts instantly."""
+        """While a song plays, look up the next one in the background so it starts instantly.
+
+        Only runs while something is playing (self.current is set); when the player is idle it
+        pops the track and resolves it right away anyway. Does nothing if the next track already
+        has a lookup in flight, so it is safe to call repeatedly.
+        """
         if self.current and self.queue and self.queue[0].pending is None:
             self.queue[0].pending = asyncio.create_task(resolve(self.queue[0].query))
 
     def clear_queue(self) -> None:
+        """Empty the queue and cancel any background lookups so they don't keep running."""
         for t in self.queue:
             if t.pending:
                 t.pending.cancel()
@@ -220,6 +296,8 @@ class GuildPlayer:
                 continue
 
             track = self.queue.popleft()
+            # Use the lookup already started in the background if there is one (instant, or nearly);
+            # otherwise resolve now. "or" only calls resolve() when there is no pending lookup.
             info = await (track.pending or resolve(track.query))
             vc = self.guild.voice_client
             if vc is None:
@@ -234,11 +312,11 @@ class GuildPlayer:
             source = discord.FFmpegPCMAudio(info["url"], **FFMPEG_OPTS)
             vc.play(source, after=lambda _err: loop.call_soon_threadsafe(finished.set))
             await self.channel.send(f"Now playing: **{track.title}**")
-            self._prefetch_next()
+            self._prefetch_next()  # playback has started: get the following song ready in the background
             await finished.wait()
 
     async def stop(self) -> None:
-        self.clear_queue()
+        self.clear_queue()  # also cancels any prefetch lookups
         if self.task is not asyncio.current_task():
             self.task.cancel()
         players.pop(self.guild.id, None)
