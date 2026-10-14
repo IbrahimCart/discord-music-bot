@@ -88,25 +88,53 @@ def _looks_like_edit(title: Optional[str], query: str) -> bool:
     return bool(_edit_words(title) - _edit_words(query))
 
 
+# Titles containing these words are music videos (or other videos) and are never played.
+VIDEO_RE = re.compile(r"\b(videos?|mv|m/v)\b", re.I)  # covers "Music Video", "Official Video", "[MV]"...
+
+
+def _is_video(title: Optional[str], query: str) -> bool:
+    """True if the title says it's a video. Not applied if the search text itself contains one of
+    these words, so a song like "Video Games" or a search for "song music video" still works."""
+    return bool(VIDEO_RE.search(title or "")) and not VIDEO_RE.search(query)
+
+
+def _audio_query(query: str) -> str:
+    """Add "audio" to the search text so YouTube ranks audio uploads (and auto-generated
+    "- Topic" channels) above music videos. Skipped if the user already said what they want."""
+    return query if re.search(r"\b(audio|video|lyrics?|mv)\b", query, re.I) else f"{query} audio"
+
+
+def _is_clean_audio(info: dict, query: str) -> bool:
+    """True if a result is clearly the plain audio: an auto-generated "- Topic" channel, or a
+    title saying audio/lyrics, and no edit-style words we weren't asked for."""
+    title = info.get("title") or ""
+    channel = info.get("channel") or info.get("uploader") or ""
+    if _looks_like_edit(title, query):
+        return False
+    return channel.endswith(" - Topic") or bool(re.search(r"\b(audio|lyrics?)\b", title, re.I))
+
+
 def _score(entry: dict, query: str) -> int:
-    """Rank a search result: higher = more likely to be the original, official upload."""
+    """Rank a search result: higher = more likely to be the plain, original audio upload."""
     title = entry.get("title") or ""
     channel = entry.get("channel") or entry.get("uploader") or ""
     score = 0
     if channel.endswith(" - Topic"):  # YouTube's auto-generated official-audio channels
         score += 3
-    if "vevo" in channel.lower():  # label-run official channels
+    if re.search(r"\b(audio|lyrics?)\b", title, re.I):  # "(Official Audio)", "(Lyrics)"...
         score += 2
-    if re.search(r"official (audio|music video|video)", title, re.I):
-        score += 2
-    score -= 3 * len(_edit_words(title) - _edit_words(query))  # remix/mashup/etc. not asked for
+    if "vevo" in channel.lower():  # VEVO channels mostly host the music videos, so rank them lower
+        score -= 2
+    # remix/mashup/etc. that weren't asked for (videos never get this far, see _is_video)
+    score -= 3 * len(_edit_words(title) - _edit_words(query))
     return score
 
 
 def _youtube_candidates(query: str) -> list[dict]:
     """List the top YouTube search results (id, url, title, channel), in YouTube's order.
 
-    Only used as a fallback when the very first result is a bad pick or can't be played; see resolve().
+    Only used as a fallback when the very first result isn't clearly plain audio or can't be played;
+    see resolve(). Pass it the same audio-biased search text that resolve() used.
     """
     # extract_flat = just list the results, don't fetch each video's stream info. That keeps this
     # to one cheap request; we only do the expensive lookup for results we actually try.
@@ -137,33 +165,43 @@ async def _try(source: str) -> Optional[dict]:
 async def resolve(query: str) -> Optional[dict]:
     """Return yt-dlp info (with a direct stream 'url') for a link or search text.
 
-    Search text takes the top YouTube result directly (one fast lookup) and uses it if it looks
-    like the real song. If it fails to play, or its title looks like an edit/remix/reupload, the
-    next few results are listed and ranked (official "- Topic" / VEVO / "official audio" first,
-    edit-style titles last) and tried in order, then SoundCloud. Stream URLs expire, so this runs
-    shortly before a track plays.
+    Search text gets "audio" added, and the top YouTube result is used straight away (one lookup)
+    if it is clearly plain audio: a "- Topic" channel or an audio/lyrics title, with no edit or
+    remix words. Results whose title says "video" (music video, official video, MV...) are never
+    played. Otherwise (or if the top result fails to play) the next few results are listed, videos
+    removed, ranked (auto-generated "- Topic" and "audio" titles first, edits and VEVO last) and
+    tried in order, then SoundCloud. If every result is a video, nothing is found rather than
+    playing a video. Stream URLs expire, so this runs shortly before a track plays.
     """
     # A pasted link: just resolve that one link, no searching or ranking.
     if URL_RE.match(query):
         return await _try(query)
 
-    # Fast path: the top YouTube result is the right song almost every time, and this is a
-    # single lookup. Keep it unless its title looks like an edit we weren't asked for.
-    info = await _try(f"ytsearch1:{query}")
-    if info and not _looks_like_edit(info.get("title"), query):
-        return info
-    if info:
-        log.info("Top result %r looks like an edit; checking other results", info.get("title"))
+    # Nudge YouTube toward audio uploads instead of music videos (see _audio_query).
+    search = _audio_query(query)
 
-    # Slow path: either the top result failed to play, or it looks like an edit. List the next
-    # few results so we can choose a better one.
+    # Fast path: one lookup. Keep the top result if it is clearly plain audio.
+    info = await _try(f"ytsearch1:{search}")
+    top_failed = info is None  # couldn't be played (DRM, private...): it must not be retried below
+    if info and _is_video(info.get("title"), query):
+        log.info("Top result %r is a video; skipping it", info.get("title"))
+        info = None  # never play it; the listing below filters it out too
+    elif info and _is_clean_audio(info, query):
+        return info
+    elif info:
+        log.info("Top result %r isn't clearly plain audio; checking other results", info.get("title"))
+
+    # Slow path: the top result failed to play, or it might be a music video or edit. List the
+    # next few results so we can choose a better one.
     try:
-        candidates = await asyncio.get_running_loop().run_in_executor(None, _youtube_candidates, query)
+        candidates = await asyncio.get_running_loop().run_in_executor(None, _youtube_candidates, search)
     except Exception as exc:
         log.warning("YouTube search failed for %r: %s", query, str(exc)[:200])
         candidates = []
-    if info is None and candidates:
+    if top_failed and candidates:
         candidates = candidates[1:]  # the first result is the one that just failed to play
+    # Drop every video from the listing so none of them can be picked.
+    candidates = [e for e in candidates if not _is_video(e.get("title"), query)]
 
     # Best-looking first. sorted() is stable, so ties keep YouTube's own order.
     for entry in sorted(candidates, key=lambda e: -_score(e, query)):
@@ -176,8 +214,8 @@ async def resolve(query: str) -> Optional[dict]:
                 log.info("Using %r instead of %r", chosen.get("title"), info.get("title"))
             return chosen
 
-    # The edit-looking top result was playable but the listing gave us nothing better: play it
-    # rather than fail. (If it had failed to play, info is None and we go on to SoundCloud.)
+    # The top result was playable (and not a video) but the listing gave us nothing better, or the
+    # listing failed: play it rather than fail. (If it had failed to play, info is None and we go on to SoundCloud.)
     if info:
         return info
     # Last resort: SoundCloud (not covered by the YouTube results above).
