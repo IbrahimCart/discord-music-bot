@@ -9,7 +9,7 @@ import logging
 import os
 import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import discord
@@ -79,33 +79,41 @@ def _youtube_candidates(query: str) -> list[str]:
     return urls
 
 
+async def _try(source: str) -> Optional[dict]:
+    """Resolve one source; returns None (and logs) if it is protected, private, missing, etc."""
+    loop = asyncio.get_running_loop()
+    try:
+        info = await loop.run_in_executor(None, _extract, source)
+    except Exception as exc:  # yt-dlp raises many kinds of errors (DRM, private, region-locked...)
+        log.warning("Skipping %r: %s", source, str(exc)[:200])
+        return None
+    return info if info and info.get("url") else None
+
+
 async def resolve(query: str) -> Optional[dict]:
     """Return yt-dlp info (with a direct stream 'url') for a link or search text.
 
-    Search text tries the top YouTube results in order (skipping any that are protected or
-    unavailable), then falls back to SoundCloud. Stream URLs expire, so this is called right
-    before a track plays rather than when it is queued.
+    Search text takes the top YouTube result directly (one fast lookup). Only if that fails
+    (protected, unavailable...) does it list the next few results and try them in order, then
+    fall back to SoundCloud. Stream URLs expire, so this runs shortly before a track plays.
     """
-    loop = asyncio.get_running_loop()
     if URL_RE.match(query):
-        sources = [query]
-    else:
-        try:
-            sources = await loop.run_in_executor(None, _youtube_candidates, query)
-        except Exception as exc:
-            log.warning("YouTube search failed for %r: %s", query, str(exc)[:200])
-            sources = []
-        sources.append(f"scsearch1:{query}")
+        return await _try(query)
 
-    for source in sources:
-        try:
-            info = await loop.run_in_executor(None, _extract, source)
-        except Exception as exc:  # yt-dlp raises many kinds of errors (DRM, private, region-locked...)
-            log.warning("Skipping %r: %s", source, str(exc)[:200])
-            continue
-        if info and info.get("url"):
+    info = await _try(f"ytsearch1:{query}")
+    if info:
+        return info
+
+    try:
+        candidates = await asyncio.get_running_loop().run_in_executor(None, _youtube_candidates, query)
+    except Exception as exc:
+        log.warning("YouTube search failed for %r: %s", query, str(exc)[:200])
+        candidates = []
+    for url in candidates[1:]:  # the first result is the one that just failed
+        info = await _try(url)
+        if info:
             return info
-    return None
+    return await _try(f"scsearch1:{query}")
 
 
 # --------------------------------------------------------------------------- #
@@ -162,6 +170,7 @@ class Track:
     query: str  # a link, or "Artist - Title" search text
     title: Optional[str] = None
     requester: str = ""
+    pending: Optional[asyncio.Task] = field(default=None, repr=False)  # lookup started early
 
     @property
     def label(self) -> str:
@@ -182,7 +191,19 @@ class GuildPlayer:
 
     def add(self, tracks: list[Track]) -> None:
         self.queue.extend(tracks)
+        self._prefetch_next()
         self.wake.set()
+
+    def _prefetch_next(self) -> None:
+        """While a song plays, look up the next one in the background so it starts instantly."""
+        if self.current and self.queue and self.queue[0].pending is None:
+            self.queue[0].pending = asyncio.create_task(resolve(self.queue[0].query))
+
+    def clear_queue(self) -> None:
+        for t in self.queue:
+            if t.pending:
+                t.pending.cancel()
+        self.queue.clear()
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -199,7 +220,7 @@ class GuildPlayer:
                 continue
 
             track = self.queue.popleft()
-            info = await resolve(track.query)
+            info = await (track.pending or resolve(track.query))
             vc = self.guild.voice_client
             if vc is None:
                 return
@@ -213,10 +234,11 @@ class GuildPlayer:
             source = discord.FFmpegPCMAudio(info["url"], **FFMPEG_OPTS)
             vc.play(source, after=lambda _err: loop.call_soon_threadsafe(finished.set))
             await self.channel.send(f"Now playing: **{track.title}**")
+            self._prefetch_next()
             await finished.wait()
 
     async def stop(self) -> None:
-        self.queue.clear()
+        self.clear_queue()
         if self.task is not asyncio.current_task():
             self.task.cancel()
         players.pop(self.guild.id, None)
@@ -249,7 +271,7 @@ class MusicBot(discord.Client):
         if member.id == self.user.id and before.channel and not after.channel:
             player = players.pop(member.guild.id, None)
             if player:
-                player.queue.clear()
+                player.clear_queue()
                 player.task.cancel()
 
 
