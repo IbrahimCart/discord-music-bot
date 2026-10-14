@@ -23,6 +23,7 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional: makes slash commands appear instan
 COOKIES_FILE = os.getenv("COOKIES_FILE")  # optional: cookies.txt if YouTube asks to "confirm you're not a bot"
 MAX_PLAYLIST = int(os.getenv("MAX_PLAYLIST", "100"))
 IDLE_TIMEOUT = 300  # seconds of an empty queue before the bot leaves
+SEARCH_RESULTS = 5  # how many YouTube results to try, in order, before falling back to SoundCloud
 
 log = logging.getLogger("musicbot")
 
@@ -65,19 +66,42 @@ def _extract(source: str) -> Optional[dict]:
     return info
 
 
+def _youtube_candidates(query: str) -> list[str]:
+    """Return links for the top YouTube search results (a quick listing, nothing is resolved yet)."""
+    opts = {**YDL_OPTS, "extract_flat": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch{SEARCH_RESULTS}:{query}", download=False)
+    urls = []
+    for entry in (info or {}).get("entries") or []:
+        url = entry and (entry.get("url") or entry.get("webpage_url"))
+        if url:
+            urls.append(url)
+    return urls
+
+
 async def resolve(query: str) -> Optional[dict]:
     """Return yt-dlp info (with a direct stream 'url') for a link or search text.
 
-    Search text tries YouTube first, then SoundCloud. Stream URLs expire, so this is
-    called right before a track plays rather than when it is queued.
+    Search text tries the top YouTube results in order (skipping any that are protected or
+    unavailable), then falls back to SoundCloud. Stream URLs expire, so this is called right
+    before a track plays rather than when it is queued.
     """
-    sources = [query] if URL_RE.match(query) else [f"ytsearch1:{query}", f"scsearch1:{query}"]
     loop = asyncio.get_running_loop()
+    if URL_RE.match(query):
+        sources = [query]
+    else:
+        try:
+            sources = await loop.run_in_executor(None, _youtube_candidates, query)
+        except Exception as exc:
+            log.warning("YouTube search failed for %r: %s", query, str(exc)[:200])
+            sources = []
+        sources.append(f"scsearch1:{query}")
+
     for source in sources:
         try:
             info = await loop.run_in_executor(None, _extract, source)
-        except Exception as exc:  # yt-dlp raises many kinds of errors
-            log.warning("Lookup failed for %r: %s", source, str(exc)[:200])
+        except Exception as exc:  # yt-dlp raises many kinds of errors (DRM, private, region-locked...)
+            log.warning("Skipping %r: %s", source, str(exc)[:200])
             continue
         if info and info.get("url"):
             return info
