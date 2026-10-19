@@ -8,7 +8,7 @@ A small Discord bot that plays music in a voice channel.
 - Slash commands: `/play`, `/skip`, `/pause`, `/resume`, `/queue`, `/stop`
 - Leaves the voice channel after 5 minutes with an empty queue
 
-> **For private use in your own server.** Streaming from YouTube with yt-dlp goes against YouTube's terms of service, and Spotify does not allow its audio to be played by bots. Don't make this bot public.
+> **For private use in your own server.** Streaming from YouTube with yt-dlp goes against YouTube's terms of service, and Spotify does not allow its audio to be played by bots. Run it only in your own server and don't offer it as a public bot for others to add.
 
 ## Setup
 
@@ -20,8 +20,6 @@ Works on macOS and Windows. Steps that differ are marked.
 git clone https://github.com/IbrahimCart/discord-music-bot.git
 cd discord-music-bot
 ```
-
-(The repo is private, so GitHub will ask you to sign in. On Windows, Git for Windows opens a browser sign-in the first time.)
 
 ### 2. Install the tools
 
