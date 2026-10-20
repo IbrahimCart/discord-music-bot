@@ -34,6 +34,9 @@ ALONE_TIMEOUT = 30
 # (edit/remix/reupload, DRM-protected, private, region-locked...).
 # Higher = more chances to find the right version, but a slower fallback.
 SEARCH_RESULTS = 5
+# When we know how long a song should be (Spotify tells us), a YouTube result whose length is within
+# this many seconds counts as the same recording; anything further off is probably another version.
+DURATION_TOLERANCE = 5
 
 log = logging.getLogger("musicbot")
 
@@ -148,8 +151,17 @@ def _is_clean_audio(info: dict, query: str) -> bool:
     return channel.endswith(" - Topic") or bool(re.search(r"\b(audio|lyrics?)\b", title, re.I))
 
 
-def _score(entry: dict, query: str) -> int:
-    """Rank a search result: higher = more likely to be the plain, original audio upload."""
+def _duration_ok(info: dict, want: Optional[float]) -> bool:
+    """True if we don't know the wanted length, the result has no length, or the two roughly match."""
+    got = info.get("duration")
+    return want is None or not got or abs(got - want) <= DURATION_TOLERANCE
+
+
+def _score(entry: dict, query: str, want: Optional[float] = None) -> int:
+    """Rank a search result: higher = more likely to be the plain, original audio upload.
+
+    want is the song's real length in seconds when known (Spotify links); a matching length is the
+    best sign we have the exact recording, a very different one means another version."""
     title = entry.get("title") or ""
     channel = entry.get("channel") or entry.get("uploader") or ""
     # Matching the search text matters most: it outweighs all the bonuses below combined, so a
@@ -163,6 +175,10 @@ def _score(entry: dict, query: str) -> int:
         score -= 2
     # remix/mashup/etc. that weren't asked for (videos never get this far, see _is_video)
     score -= 3 * len(_edit_words(title) - _edit_words(query))
+    got = entry.get("duration")
+    if want is not None and got:
+        diff = abs(got - want)
+        score += 6 if diff <= DURATION_TOLERANCE else (-6 if diff > 15 else 0)
     return score
 
 
@@ -198,8 +214,12 @@ async def _try(source: str) -> Optional[dict]:
     return info if info and info.get("url") else None
 
 
-async def resolve(query: str) -> Optional[dict]:
+async def resolve(query: str, duration: Optional[float] = None) -> Optional[dict]:
     """Return yt-dlp info (with a direct stream 'url') for a link or search text.
+
+    A pasted link is always played exactly as given. duration (seconds, optional) is the real
+    length of the song when known, e.g. from a Spotify link: search results whose length doesn't
+    match are passed over so we play the same recording, not a remix or edit of it.
 
     Search text gets "audio" added, and the top YouTube result is used straight away (one lookup)
     if it is clearly plain audio: a "- Topic" channel or an audio/lyrics title, with no edit or
@@ -222,10 +242,10 @@ async def resolve(query: str) -> Optional[dict]:
     if info and _is_video(info.get("title"), query):
         log.info("Top result %r is a video; skipping it", info.get("title"))
         info = None  # never play it; the listing below filters it out too
-    elif info and _is_clean_audio(info, query):
+    elif info and _is_clean_audio(info, query) and _duration_ok(info, duration):
         return info
     elif info:
-        log.info("Top result %r isn't clearly plain audio; checking other results", info.get("title"))
+        log.info("Top result %r isn't clearly the right plain audio; checking other results", info.get("title"))
 
     # Slow path: the top result failed to play, or it might be a music video or edit. List the
     # next few results so we can choose a better one.
@@ -243,7 +263,7 @@ async def resolve(query: str) -> Optional[dict]:
     ]
 
     # Best-looking first. sorted() is stable, so ties keep YouTube's own order.
-    for entry in sorted(candidates, key=lambda e: -_score(e, query)):
+    for entry in sorted(candidates, key=lambda e: -_score(e, query, duration)):
         if info and entry.get("id") == info.get("id"):
             chosen = info  # already looked up above, no need to ask YouTube again
         else:
@@ -296,7 +316,7 @@ def _track_query(track: dict) -> Optional[str]:
     return f"{artist} - {name}".strip(" -")
 
 
-def _spotify_embed_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
+def _spotify_embed_queries(kind: str, sp_id: str) -> tuple[str, list[tuple[str, Optional[float]]]]:
     """Read a public album/playlist from Spotify's embed player page, which needs no login.
 
     Fallback for when the Web API refuses: Spotify now wants a signed-in user (not just app keys)
@@ -316,17 +336,27 @@ def _spotify_embed_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
         raise RuntimeError("Couldn't read that Spotify page (it may be private, or Spotify changed it).")
     # "subtitle" holds the artists, comma-separated; the first one is enough for the search.
     tracks = [
-        {"name": t.get("title"), "artists": [{"name": (t.get("subtitle") or "").split(",")[0].strip()}]}
+        {
+            "name": t.get("title"),
+            "artists": [{"name": (t.get("subtitle") or "").split(",")[0].strip()}],
+            # the embed page lists each song's length in milliseconds (None if that ever changes)
+            "duration_ms": t.get("duration") if isinstance(t.get("duration"), (int, float)) else None,
+        }
         for t in items
     ]
-    queries = [q for q in (_track_query(t) for t in tracks) if q]
+    queries = [(q, _track_seconds(t)) for t in tracks if (q := _track_query(t))]
     return entity.get("name") or f"Spotify {kind}", queries
 
 
-def _spotify_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
-    """Search texts for a Spotify link. Playlists come back shuffled: a random MAX_PLAYLIST songs
-    from the whole playlist (or from its first 100 if only the embed page could be read).
-    Albums keep their track order."""
+def _track_seconds(track: dict) -> Optional[float]:
+    ms = (track or {}).get("duration_ms")
+    return ms / 1000 if ms else None
+
+
+def _spotify_queries(kind: str, sp_id: str) -> tuple[str, list[tuple[str, Optional[float]]]]:
+    """Name of the link plus (search text, length in seconds or None) for each track. Playlists
+    come back shuffled: a random MAX_PLAYLIST songs from the whole playlist (or from its first 100
+    if only the embed page could be read). Albums keep their track order."""
     try:
         name, queries = _spotify_api_queries(kind, sp_id)
     except Exception as exc:
@@ -341,13 +371,14 @@ def _spotify_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
     return name, queries[:MAX_PLAYLIST]
 
 
-def _spotify_api_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
+def _spotify_api_queries(kind: str, sp_id: str) -> tuple[str, list[tuple[str, Optional[float]]]]:
     sp = _spotify_client()
     if sp is None:
         raise RuntimeError("Spotify isn't set up. Add SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET to .env.")
     if kind == "track":
         t = sp.track(sp_id)
-        return t["name"], [q for q in [_track_query(t)] if q]
+        q = _track_query(t)
+        return t["name"], [(q, _track_seconds(t))] if q else []
 
     if kind == "album":
         album = sp.album(sp_id)
@@ -363,7 +394,7 @@ def _spotify_api_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
             tracks += [i.get("track") for i in page["items"]]
             page = sp.next(page) if page.get("next") and len(tracks) < PLAYLIST_FETCH_LIMIT else None
 
-    queries = [q for q in (_track_query(t) for t in tracks) if q]
+    queries = [(q, _track_seconds(t)) for t in tracks if (q := _track_query(t))]
     return name, queries
 
 
@@ -375,6 +406,7 @@ class Track:
     query: str  # a link, or "Artist - Title" search text
     title: Optional[str] = None
     requester: str = ""
+    duration: Optional[float] = None  # real length in seconds when known (Spotify), used to pick the right upload
     # Background lookup of this track's stream, started while the previous song is still playing
     # (see GuildPlayer._prefetch_next). None until/unless a prefetch was started.
     pending: Optional[asyncio.Task] = field(default=None, repr=False)
@@ -410,7 +442,7 @@ class GuildPlayer:
         has a lookup in flight, so it is safe to call repeatedly.
         """
         if self.current and self.queue and self.queue[0].pending is None:
-            self.queue[0].pending = asyncio.create_task(resolve(self.queue[0].query))
+            self.queue[0].pending = asyncio.create_task(resolve(self.queue[0].query, self.queue[0].duration))
 
     def clear_queue(self) -> None:
         """Empty the queue and cancel any background lookups so they don't keep running."""
@@ -452,7 +484,7 @@ class GuildPlayer:
             track = self.queue.popleft()
             # Use the lookup already started in the background if there is one (instant, or nearly);
             # otherwise resolve now. "or" only calls resolve() when there is no pending lookup.
-            info = await (track.pending or resolve(track.query))
+            info = await (track.pending or resolve(track.query, track.duration))
             vc = self.guild.voice_client
             if vc is None:
                 return
@@ -550,7 +582,7 @@ async def play(interaction: discord.Interaction, query: str):
             return await interaction.followup.send(f"Spotify error: {str(exc)[:300]}")
         if not queries:
             return await interaction.followup.send("That Spotify link had no playable tracks.")
-        tracks = [Track(q, requester=who) for q in queries]
+        tracks = [Track(q, requester=who, duration=d) for q, d in queries]
         shuffled = " (shuffled)" if match.group(1) == "playlist" else ""
         summary = f"Queued **{len(tracks)}** track(s) from **{name}**{shuffled}."
     else:
