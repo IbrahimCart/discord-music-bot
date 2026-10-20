@@ -98,6 +98,32 @@ def _is_video(title: Optional[str], query: str) -> bool:
     return bool(VIDEO_RE.search(title or "")) and not VIDEO_RE.search(query)
 
 
+# Words ignored when checking that a result actually matches what was asked for.
+FILLER_WORDS = {
+    "a", "an", "the", "and", "of", "by", "ft", "feat", "featuring", "x",
+    "official", "audio", "lyrics", "lyric", "song", "topic",
+}
+# Share of the search words a result's title + channel must contain to be played at all.
+# Below 1.0 so small typos or a missing "the" still work, but "shares one word" doesn't.
+MIN_MATCH = 0.6
+
+
+def _words(text: Optional[str]) -> set[str]:
+    """Lower-cased words in some text, apostrophes dropped ("Don't" -> "dont"), filler removed."""
+    text = re.sub(r"['’]", "", (text or "").casefold())
+    return {w for w in re.findall(r"\w+", text) if w not in FILLER_WORDS}
+
+
+def _match(entry: dict, query: str) -> float:
+    """Share (0-1) of the search words found in the result's title or channel name.
+    The channel counts because "Artist - Topic" uploads often leave the artist out of the title."""
+    wanted = _words(query)
+    if not wanted:
+        return 1.0
+    have = _words(f"{entry.get('title') or ''} {entry.get('channel') or entry.get('uploader') or ''}")
+    return len(wanted & have) / len(wanted)
+
+
 def _audio_query(query: str) -> str:
     """Add "audio" to the search text so YouTube ranks audio uploads (and auto-generated
     "- Topic" channels) above music videos. Skipped if the user already said what they want."""
@@ -106,10 +132,11 @@ def _audio_query(query: str) -> str:
 
 def _is_clean_audio(info: dict, query: str) -> bool:
     """True if a result is clearly the plain audio: an auto-generated "- Topic" channel, or a
-    title saying audio/lyrics, and no edit-style words we weren't asked for."""
+    title saying audio/lyrics, every search word present, and no edit-style words we weren't
+    asked for."""
     title = info.get("title") or ""
     channel = info.get("channel") or info.get("uploader") or ""
-    if _looks_like_edit(title, query):
+    if _match(info, query) < 1.0 or _looks_like_edit(title, query):
         return False
     return channel.endswith(" - Topic") or bool(re.search(r"\b(audio|lyrics?)\b", title, re.I))
 
@@ -118,7 +145,9 @@ def _score(entry: dict, query: str) -> int:
     """Rank a search result: higher = more likely to be the plain, original audio upload."""
     title = entry.get("title") or ""
     channel = entry.get("channel") or entry.get("uploader") or ""
-    score = 0
+    # Matching the search text matters most: it outweighs all the bonuses below combined, so a
+    # "- Topic" upload of a different song can't beat the song that was actually asked for.
+    score = round(20 * _match(entry, query))
     if channel.endswith(" - Topic"):  # YouTube's auto-generated official-audio channels
         score += 3
     if re.search(r"\b(audio|lyrics?)\b", title, re.I):  # "(Official Audio)", "(Lyrics)"...
@@ -200,8 +229,11 @@ async def resolve(query: str) -> Optional[dict]:
         candidates = []
     if top_failed and candidates:
         candidates = candidates[1:]  # the first result is the one that just failed to play
-    # Drop every video from the listing so none of them can be picked.
-    candidates = [e for e in candidates if not _is_video(e.get("title"), query)]
+    # Drop every video, and every result that doesn't match the search text, so none can be picked.
+    candidates = [
+        e for e in candidates
+        if not _is_video(e.get("title"), query) and _match(e, query) >= MIN_MATCH
+    ]
 
     # Best-looking first. sorted() is stable, so ties keep YouTube's own order.
     for entry in sorted(candidates, key=lambda e: -_score(e, query)):
@@ -216,10 +248,17 @@ async def resolve(query: str) -> Optional[dict]:
 
     # The top result was playable (and not a video) but the listing gave us nothing better, or the
     # listing failed: play it rather than fail. (If it had failed to play, info is None and we go on to SoundCloud.)
-    if info:
+    if info and _match(info, query) >= MIN_MATCH:
         return info
-    # Last resort: SoundCloud (not covered by the YouTube results above).
-    return await _try(f"scsearch1:{query}")
+    if info:
+        log.info("Top result %r doesn't match %r; not playing it", info.get("title"), query)
+    # Last resort: SoundCloud (not covered by the YouTube results above). Same match check, so a
+    # different song is never played just because nothing better was found.
+    info = await _try(f"scsearch1:{query}")
+    if info and _match(info, query) < MIN_MATCH:
+        log.info("SoundCloud result %r doesn't match %r; not playing it", info.get("title"), query)
+        return None
+    return info
 
 
 # --------------------------------------------------------------------------- #
@@ -234,12 +273,20 @@ def _spotify_client():
     return spotipy.Spotify(auth_manager=SpotifyClientCredentials())
 
 
+# Spotify title extras that YouTube titles usually leave out, e.g. "Song - Remastered 2011",
+# "Song (feat. Someone)". Left in, they'd count as search words the right upload doesn't have.
+SPOTIFY_EXTRA_RE = re.compile(
+    r"\s*(?:-\s*[^-]*\bremaster(?:ed)?\b.*$|[(\[](?:feat\.?|ft\.?|with)\s[^)\]]*[)\]])", re.I
+)
+
+
 def _track_query(track: dict) -> Optional[str]:
     if not track or not track.get("name"):
         return None
     artists = track.get("artists") or []
     artist = artists[0]["name"] if artists else ""
-    return f"{artist} - {track['name']}".strip(" -")
+    name = SPOTIFY_EXTRA_RE.sub("", track["name"]).strip() or track["name"]
+    return f"{artist} - {name}".strip(" -")
 
 
 def _spotify_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
