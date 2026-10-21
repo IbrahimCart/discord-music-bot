@@ -5,9 +5,12 @@ Private-server use only. See README.md for setup.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import random
 import re
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field  # "field" lets Track.pending default to None without sharing state
 from typing import Optional
@@ -22,6 +25,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")  # optional: makes slash commands appear instantly
 COOKIES_FILE = os.getenv("COOKIES_FILE")  # optional: cookies.txt if YouTube asks to "confirm you're not a bot"
 MAX_PLAYLIST = int(os.getenv("MAX_PLAYLIST", "100"))
+PLAYLIST_FETCH_LIMIT = 2000  # most songs listed from one Spotify playlist before shuffling
 IDLE_TIMEOUT = 300  # seconds of an empty queue before the bot leaves
 # How many YouTube results to list when the top result is a bad pick or fails to play
 # (edit/remix/reupload, DRM-protected, private, region-locked...).
@@ -289,7 +293,52 @@ def _track_query(track: dict) -> Optional[str]:
     return f"{artist} - {name}".strip(" -")
 
 
+def _spotify_embed_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
+    """Read a public album/playlist from Spotify's embed player page, which needs no login.
+
+    Fallback for when the Web API refuses: Spotify now wants a signed-in user (not just app keys)
+    to list a playlist's songs. The embed page is unofficial, so it may change, and it only shows
+    the first 100 tracks.
+    """
+    req = urllib.request.Request(
+        f"https://open.spotify.com/embed/{kind}/{sp_id}", headers={"User-Agent": "Mozilla/5.0"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        html = resp.read().decode("utf-8")
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+    try:
+        entity = json.loads(m.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+        items = entity["trackList"]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise RuntimeError("Couldn't read that Spotify page (it may be private, or Spotify changed it).")
+    # "subtitle" holds the artists, comma-separated; the first one is enough for the search.
+    tracks = [
+        {"name": t.get("title"), "artists": [{"name": (t.get("subtitle") or "").split(",")[0].strip()}]}
+        for t in items
+    ]
+    queries = [q for q in (_track_query(t) for t in tracks) if q]
+    return entity.get("name") or f"Spotify {kind}", queries
+
+
 def _spotify_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
+    """Search texts for a Spotify link. Playlists come back shuffled: a random MAX_PLAYLIST songs
+    from the whole playlist (or from its first 100 if only the embed page could be read).
+    Albums keep their track order."""
+    try:
+        name, queries = _spotify_api_queries(kind, sp_id)
+    except Exception as exc:
+        # 401/403/404: Spotify refused (user login required, or a Spotify-made playlist that apps
+        # can't see). Albums and playlists can still be read from the public embed page.
+        if kind == "track" or getattr(exc, "http_status", None) not in (401, 403, 404):
+            raise
+        log.info("Spotify API refused %s %s (%s); using the embed page", kind, sp_id, exc.http_status)
+        name, queries = _spotify_embed_queries(kind, sp_id)
+    if kind == "playlist":
+        random.shuffle(queries)
+    return name, queries[:MAX_PLAYLIST]
+
+
+def _spotify_api_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
     sp = _spotify_client()
     if sp is None:
         raise RuntimeError("Spotify isn't set up. Add SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET to .env.")
@@ -304,14 +353,14 @@ def _spotify_queries(kind: str, sp_id: str) -> tuple[str, list[str]]:
         while page:
             tracks += page["items"]
             page = sp.next(page) if page.get("next") and len(tracks) < MAX_PLAYLIST else None
-    else:  # playlist
+    else:  # playlist: list the whole thing (up to a sanity limit) so the shuffle can pick from all of it
         name = sp.playlist(sp_id, fields="name")["name"]
         page, tracks = sp.playlist_items(sp_id, additional_types=("track",)), []
         while page:
             tracks += [i.get("track") for i in page["items"]]
-            page = sp.next(page) if page.get("next") and len(tracks) < MAX_PLAYLIST else None
+            page = sp.next(page) if page.get("next") and len(tracks) < PLAYLIST_FETCH_LIMIT else None
 
-    queries = [q for q in (_track_query(t) for t in tracks[:MAX_PLAYLIST]) if q]
+    queries = [q for q in (_track_query(t) for t in tracks) if q]
     return name, queries
 
 
@@ -468,7 +517,8 @@ async def play(interaction: discord.Interaction, query: str):
         if not queries:
             return await interaction.followup.send("That Spotify link had no playable tracks.")
         tracks = [Track(q, requester=who) for q in queries]
-        summary = f"Queued **{len(tracks)}** track(s) from **{name}**."
+        shuffled = " (shuffled)" if match.group(1) == "playlist" else ""
+        summary = f"Queued **{len(tracks)}** track(s) from **{name}**{shuffled}."
     else:
         tracks = [Track(query, requester=who)]
         summary = f"Queued: **{query}**"
