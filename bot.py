@@ -27,6 +27,9 @@ COOKIES_FILE = os.getenv("COOKIES_FILE")  # optional: cookies.txt if YouTube ask
 MAX_PLAYLIST = int(os.getenv("MAX_PLAYLIST", "100"))
 PLAYLIST_FETCH_LIMIT = 2000  # most songs listed from one Spotify playlist before shuffling
 IDLE_TIMEOUT = 300  # seconds of an empty queue before the bot leaves
+# Seconds the bot waits after the last person leaves its voice channel before leaving too.
+# Short, so it doesn't sit in an empty call, but long enough to survive someone briefly dropping out.
+ALONE_TIMEOUT = 30
 # How many YouTube results to list when the top result is a bad pick or fails to play
 # (edit/remix/reupload, DRM-protected, private, region-locked...).
 # Higher = more chances to find the right version, but a slower fallback.
@@ -391,6 +394,7 @@ class GuildPlayer:
         self.queue: deque[Track] = deque()
         self.current: Optional[Track] = None
         self.wake = asyncio.Event()
+        self.leave_task: Optional[asyncio.Task] = None  # countdown while nobody else is in the call
         self.task = asyncio.create_task(self._run())
 
     def add(self, tracks: list[Track]) -> None:
@@ -414,6 +418,22 @@ class GuildPlayer:
             if t.pending:
                 t.pending.cancel()
         self.queue.clear()
+
+    def leave_soon(self) -> None:
+        """Start the countdown to leave an empty call (does nothing if it's already running)."""
+        if self.leave_task is None or self.leave_task.done():
+            self.leave_task = asyncio.create_task(self._leave_when_alone())
+
+    def cancel_leave(self) -> None:
+        """Someone is back in the call: stop the countdown."""
+        if self.leave_task and self.leave_task is not asyncio.current_task():
+            self.leave_task.cancel()
+        self.leave_task = None
+
+    async def _leave_when_alone(self) -> None:
+        await asyncio.sleep(ALONE_TIMEOUT)
+        await self.channel.send("Everyone left the voice channel, so I left too.")
+        await self.stop()
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -451,6 +471,7 @@ class GuildPlayer:
 
     async def stop(self) -> None:
         self.clear_queue()  # also cancels any prefetch lookups
+        self.cancel_leave()
         if self.task is not asyncio.current_task():
             self.task.cancel()
         players.pop(self.guild.id, None)
@@ -484,7 +505,20 @@ class MusicBot(discord.Client):
             player = players.pop(member.guild.id, None)
             if player:
                 player.clear_queue()
+                player.cancel_leave()
                 player.task.cancel()
+            return
+
+        # Someone joined or left the bot's channel (or the bot was moved): if no real people are
+        # left, leave after ALONE_TIMEOUT; if someone is back, stay.
+        vc = member.guild.voice_client
+        player = players.get(member.guild.id)
+        if not vc or not vc.channel or not player or vc.channel not in (before.channel, after.channel):
+            return
+        if any(not m.bot for m in vc.channel.members):
+            player.cancel_leave()
+        else:
+            player.leave_soon()
 
 
 bot = MusicBot()
